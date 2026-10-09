@@ -2,7 +2,7 @@
    The Gemini key lives ONLY in the Vercel env var GEMINI_API_KEY. */
 
 const FIREBASE_WEB_KEY = process.env.FIREBASE_WEB_API_KEY || "AIzaSyCoYCIqZH-HOrT6TDOHCxEx2gwDkwdWUB4"; // public Firebase key, safe
-const MODEL = process.env.GEMINI_MODEL || "gemini-2.5-flash";
+const MODEL = process.env.GEMINI_MODEL || "gemini-3.8-flash";
 const MAX_BODY_CHARS = 8000;
 // Comma-separated list, e.g. https://yourname.github.io  (no path, no trailing slash)
 const ALLOWED_ORIGINS = (process.env.ALLOWED_ORIGINS || "").split(",").map(s => s.trim()).filter(Boolean);
@@ -20,7 +20,12 @@ function setCors(req, res) {
   res.setHeader("Access-Control-Max-Age", "86400");
 }
 
+const SESSION_CACHE = new Map(); // idToken -> { uid, until }
+const SESSION_TTL_MS = 5 * 60 * 1000;
+
 async function verifyFirebaseUser(idToken) {
+  const hit = SESSION_CACHE.get(idToken);
+  if (hit && hit.until > Date.now()) return hit.uid;
   try {
     const r = await fetch(
       `https://identitytoolkit.googleapis.com/v1/accounts:lookup?key=${FIREBASE_WEB_KEY}`,
@@ -28,7 +33,12 @@ async function verifyFirebaseUser(idToken) {
     );
     if (!r.ok) return null;
     const d = await r.json();
-    return d.users && d.users[0] ? d.users[0].localId : null;
+    const uid = d.users && d.users[0] ? d.users[0].localId : null;
+    if (uid) {
+      if (SESSION_CACHE.size > 200) SESSION_CACHE.clear();
+      SESSION_CACHE.set(idToken, { uid, until: Date.now() + SESSION_TTL_MS });
+    }
+    return uid;
   } catch (e) {
     return null;
   }
@@ -83,8 +93,8 @@ module.exports = async function handler(req, res) {
 
   // gemini-2.5-flash "thinks" before answering and that thinking uses up the output limit,
   // which caused empty replies. Turn thinking off for flash models.
-  const generationConfig = { maxOutputTokens: isTask ? 500 : 300 };
-  if (/flash/.test(MODEL)) generationConfig.thinkingConfig = { thinkingBudget: 0 };
+  const generationConfig = { maxOutputTokens: isTask ? 400 : 300 };
+  if (/flash/.test(MODEL) && !globalThis.__noThinkingConfig) generationConfig.thinkingConfig = { thinkingBudget: 0 };
 
   // Calls Gemini once. Returns { ok, status, text, finishReason, message }.
   async function callGemini(config) {
@@ -101,7 +111,9 @@ module.exports = async function handler(req, res) {
     return {
       ok: g.ok, status: g.status, text,
       finishReason: data.candidates?.[0]?.finishReason || data.promptFeedback?.blockReason || "",
-      message: (data.error && data.error.message ? String(data.error.message) : "").slice(0, 160)
+      // Never pass key-like text to the browser
+      message: (data.error && data.error.message ? String(data.error.message) : "")
+        .replace(/api_key:[^\s'")]+/gi, "[hidden]").replace(/AIza[\w-]+|AQ\.[\w-]+/g, "[hidden]").slice(0, 160)
     };
   }
 
@@ -110,6 +122,7 @@ module.exports = async function handler(req, res) {
 
     // Some models reject thinkingConfig: retry once without it
     if (!r.ok && r.status === 400 && generationConfig.thinkingConfig) {
+      globalThis.__noThinkingConfig = true; // remember, so later requests skip the wasted attempt
       const plain = { maxOutputTokens: generationConfig.maxOutputTokens };
       r = await callGemini(plain);
     }
@@ -120,15 +133,15 @@ module.exports = async function handler(req, res) {
 
     if (!r.ok) {
       console.error("Gemini error", r.status, r.message);
-      return res.status(502).json({ error: "AI service unavailable", detail: `Gemini ${r.status}${r.message ? ": " + r.message : ""}` });
+      return res.status(502).json({ error: "AI service unavailable" });
     }
     if (!r.text) {
       console.error("Empty Gemini response", r.finishReason);
-      return res.status(502).json({ error: "Empty response", detail: "Gemini sent no text" + (r.finishReason ? " (" + r.finishReason + ")" : "") });
+      return res.status(502).json({ error: "Empty response" });
     }
     return res.status(200).json({ advice: r.text });
   } catch (e) {
     console.error("Gemini fetch failed", e);
-    return res.status(502).json({ error: "AI service unavailable", detail: "Could not reach Gemini" });
+    return res.status(502).json({ error: "AI service unavailable" });
   }
 };
