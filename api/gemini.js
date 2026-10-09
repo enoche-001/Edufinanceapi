@@ -86,31 +86,49 @@ module.exports = async function handler(req, res) {
   const generationConfig = { maxOutputTokens: isTask ? 500 : 300 };
   if (/flash/.test(MODEL)) generationConfig.thinkingConfig = { thinkingBudget: 0 };
 
-  try {
+  // Calls Gemini once. Returns { ok, status, text, finishReason, message }.
+  async function callGemini(config) {
     const g = await fetch(
       `https://generativelanguage.googleapis.com/v1beta/models/${MODEL}:generateContent`,
       {
         method: "POST",
         headers: { "Content-Type": "application/json", "x-goog-api-key": apiKey },
-        body: JSON.stringify({
-          contents: [{ parts: [{ text: prompt }] }],
-          generationConfig
-        })
+        body: JSON.stringify({ contents: [{ parts: [{ text: prompt }] }], generationConfig: config })
       }
     );
-    const data = await g.json();
-    if (!g.ok) {
-      console.error("Gemini error", g.status, JSON.stringify(data).slice(0, 300));
-      return res.status(502).json({ error: "AI service unavailable" });
-    }
+    const data = await g.json().catch(() => ({}));
     const text = data.candidates?.[0]?.content?.parts?.map(p => p.text || "").join("").trim();
-    if (!text) {
-      console.error("Empty Gemini response", data.candidates?.[0]?.finishReason, JSON.stringify(data.promptFeedback || {}).slice(0, 200));
-      return res.status(502).json({ error: "Empty response" });
+    return {
+      ok: g.ok, status: g.status, text,
+      finishReason: data.candidates?.[0]?.finishReason || data.promptFeedback?.blockReason || "",
+      message: (data.error && data.error.message ? String(data.error.message) : "").slice(0, 160)
+    };
+  }
+
+  try {
+    let r = await callGemini(generationConfig);
+
+    // Some models reject thinkingConfig: retry once without it
+    if (!r.ok && r.status === 400 && generationConfig.thinkingConfig) {
+      const plain = { maxOutputTokens: generationConfig.maxOutputTokens };
+      r = await callGemini(plain);
     }
-    return res.status(200).json({ advice: text });
+    // Reply was cut off before any text (thinking used the limit): retry with more room
+    if (r.ok && !r.text && r.finishReason === "MAX_TOKENS") {
+      r = await callGemini({ maxOutputTokens: generationConfig.maxOutputTokens * 4 });
+    }
+
+    if (!r.ok) {
+      console.error("Gemini error", r.status, r.message);
+      return res.status(502).json({ error: "AI service unavailable", detail: `Gemini ${r.status}${r.message ? ": " + r.message : ""}` });
+    }
+    if (!r.text) {
+      console.error("Empty Gemini response", r.finishReason);
+      return res.status(502).json({ error: "Empty response", detail: "Gemini sent no text" + (r.finishReason ? " (" + r.finishReason + ")" : "") });
+    }
+    return res.status(200).json({ advice: r.text });
   } catch (e) {
     console.error("Gemini fetch failed", e);
-    return res.status(502).json({ error: "AI service unavailable" });
+    return res.status(502).json({ error: "AI service unavailable", detail: "Could not reach Gemini" });
   }
 };
