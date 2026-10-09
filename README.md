@@ -5,3 +5,6 @@ Env vars (Vercel > Settings > Environment Variables):
 - ALLOWED_ORIGINS (e.g. https://yourname.github.io)
 - GEMINI_MODEL (optional)
 Endpoint: POST /api/gemini
+
+Request body: { summaryData }. Old monthly review sends a plain summary; the Insights AI sends { task, instructions, data, ... } (max 8000 chars).
+Response: { advice }.
