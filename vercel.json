@@ -1,5 +1,7 @@
 {
   "functions": {
-    "api/gemini.js": { "maxDuration": 20 }
+    "api/gemini.js": { "maxDuration": 20 },
+    "api/mono.js": { "maxDuration": 30 },
+    "api/mono-webhook.js": { "maxDuration": 30 }
   }
 }
